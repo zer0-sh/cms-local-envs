@@ -1,0 +1,32 @@
+# Environment
+.env
+!.env.example
+
+# Composer
+/wordpress/vendor/
+/wordpress/web/wp/
+/wordpress/web/app/plugins/*/
+/wordpress/web/app/mu-plugins/*/
+/wordpress/web/app/themes/flavor/
+/wordpress/web/app/upgrade/
+/wordpress/web/app/uploads/
+
+/drupal/vendor/
+/drupal/web/core/
+/drupal/web/modules/contrib/
+/drupal/web/themes/contrib/
+/drupal/web/profiles/contrib/
+/drupal/web/sites/default/files/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml

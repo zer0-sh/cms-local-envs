@@ -1,0 +1,51 @@
+services:
+  drupal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: drupal-app
+    restart: unless-stopped
+    ports:
+      - "${DRUPAL_PORT:-8082}:80"
+    volumes:
+      - .:/var/www/html
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: mariadb:11-jammy
+    container_name: drupal-db
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:-drupal}
+      MYSQL_USER: ${DB_USER:-drupal}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-secret_change_me}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root_secret}
+    volumes:
+      - db_data:/var/lib/mysql
+    ports:
+      - "${DB_PORT:-3307}:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: drupal-pma
+    restart: unless-stopped
+    ports:
+      - "${PMA_PORT:-8083}:80"
+    environment:
+      PMA_HOST: db
+      PMA_USER: ${DB_USER:-drupal}
+      PMA_PASSWORD: ${DB_PASSWORD:-secret_change_me}
+    depends_on:
+      - db
+
+volumes:
+  db_data:
