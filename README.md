@@ -1,4 +1,4 @@
-# Personal Dev Environment
+# Personal Dev Environment 
 
 Local development setup with Docker for WordPress (Bedrock) and Drupal projects.
 
