@@ -28,21 +28,11 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
-        id: login
-        if: github.event_name == 'push' && secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != ''
+        if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Set deploy flag
-        id: deploycheck
-        run: |
-          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
-            echo "enabled=true" >> $GITHUB_OUTPUT
-          else
-            echo "enabled=false" >> $GITHUB_OUTPUT
-          fi
 
       - name: Extract metadata
         id: meta
@@ -58,7 +48,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: ./drupal
-          push: ${{ github.event_name == 'push' && steps.deploycheck.outputs.enabled == 'true' }}
+          push: ${{ github.event_name == 'push' }}
           load: ${{ github.event_name == 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -67,21 +57,145 @@ jobs:
 
       - name: Build summary
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
           ## Build Results
+
           | Detail | Value |
           |--------|-------|
-          | Image | \`${{ env.IMAGE_NAME }}\` |
-          | Tags | \`${{ steps.meta.outputs.version }}\` |
-          | Pushed | \`${{ github.event_name == 'push' && steps.deploycheck.outputs.enabled == 'true' }}\` |
-          | Digest | \`${{ steps.build.outputs.digest || 'N/A (PR build)' }}\` |
+          | **Image** | `${{ env.IMAGE_NAME }}` |
+          | **Tags** | `${{ steps.meta.outputs.version }}` |
+          | **Pushed** | `${{ github.event_name == 'push' }}` |
+          | **Digest** | `${{ steps.build.outputs.digest || 'N/A (PR build)' }}` |
           EOF
 
-      - name: Notice missing credentials
-        if: steps.deploycheck.outputs.enabled == 'false'
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create test .env
         run: |
-          echo "## Notice" >> $GITHUB_STEP_SUMMARY
-          echo "Docker credentials not found. Push and deploy skipped." >> $GITHUB_STEP_SUMMARY
+          cp drupal/.env.example drupal/.env 2>/dev/null || echo "SKIP_DB=1" > drupal/.env
+
+      - name: Start services
+        run: |
+          cd drupal
+          docker compose up -d --build --wait
+        timeout-minutes: 5
+
+      - name: Wait for healthy containers
+        run: |
+          echo "Waiting for services to be ready..."
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null http://localhost:8082; then
+              echo "Drupal is responding"
+              break
+            fi
+            echo "Attempt $i/30..."
+            sleep 2
+          done
+
+      - name: Run smoke tests
+        id: smoke
+        run: |
+          RESULTS=""
+          FAILED=0
+
+          # Test Drupal frontend
+          DRUPAL_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -L http://localhost:8082)
+          if [ "$DRUPAL_STATUS" -ge 200 ] && [ "$DRUPAL_STATUS" -lt 500 ]; then
+            RESULTS="${RESULTS}| Drupal frontend | \`${DRUPAL_STATUS}\` | Pass |"$'\n'
+          else
+            RESULTS="${RESULTS}| Drupal frontend | \`${DRUPAL_STATUS}\` | **FAIL** |"$'\n'
+            FAILED=1
+          fi
+
+          # Test phpMyAdmin
+          PMA_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8083)
+          if [ "$PMA_STATUS" -eq 200 ]; then
+            RESULTS="${RESULTS}| phpMyAdmin | \`${PMA_STATUS}\` | Pass |"$'\n'
+          else
+            RESULTS="${RESULTS}| phpMyAdmin | \`${PMA_STATUS}\` | **FAIL** |"$'\n'
+            FAILED=1
+          fi
+
+          # Test DB connection
+          if docker exec drupal-db mariadb -u drupal -psecret_change_me -e "SELECT 1" > /dev/null 2>&1; then
+            RESULTS="${RESULTS}| MariaDB connection | - | Pass |"$'\n'
+          else
+            RESULTS="${RESULTS}| MariaDB connection | - | **FAIL** |"$'\n'
+            FAILED=1
+          fi
+
+          # Test PHP modules
+          MODULES=$(docker exec drupal-php php -m 2>/dev/null | grep -cE 'gd|mysqli|pdo_mysql|zip|opcache|exif')
+          if [ "$MODULES" -ge 5 ]; then
+            RESULTS="${RESULTS}| PHP extensions (${MODULES}/6) | - | Pass |"$'\n'
+          else
+            RESULTS="${RESULTS}| PHP extensions (${MODULES}/6) | - | **FAIL** |"$'\n'
+            FAILED=1
+          fi
+
+          # Test Apache rewrite module
+          if docker exec drupal-php apache2ctl -M 2>/dev/null | grep -q rewrite; then
+            RESULTS="${RESULTS}| Apache mod_rewrite | - | Pass |"$'\n'
+          else
+            RESULTS="${RESULTS}| Apache mod_rewrite | - | **FAIL** |"$'\n'
+            FAILED=1
+          fi
+
+          # Container health
+          DB_STATUS=$(docker inspect --format='{{.State.Health.Status}}' drupal-db 2>/dev/null || echo "unknown")
+          if [ "$DB_STATUS" = "healthy" ]; then
+            RESULTS="${RESULTS}| DB container health | \`${DB_STATUS}\` | Pass |"$'\n'
+          else
+            RESULTS="${RESULTS}| DB container health | \`${DB_STATUS}\` | **FAIL** |"$'\n'
+            FAILED=1
+          fi
+
+          {
+            echo "## Smoke Test Results"
+            echo ""
+            if [ "$FAILED" -eq 0 ]; then
+              echo "> **All checks passed**"
+            else
+              echo "> **Some checks failed**"
+            fi
+            echo ""
+            echo "| Test | HTTP Status | Result |"
+            echo "|------|-------------|--------|"
+            echo "$RESULTS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit $FAILED
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          {
+            echo "## Container Logs"
+            echo ""
+            echo "<details><summary>drupal</summary>"
+            echo ""
+            echo '```'
+            docker logs drupal-app 2>&1 | tail -50
+            echo '```'
+            echo "</details>"
+            echo ""
+            echo "<details><summary>db</summary>"
+            echo ""
+            echo '```'
+            docker logs drupal-db 2>&1 | tail -50
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop services
+        if: always()
+        run: cd drupal && docker compose down -v
 
   security-scan:
     name: Security Scan
@@ -98,6 +212,7 @@ jobs:
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
+        id: trivy
         with:
           image-ref: '${{ env.IMAGE_NAME }}:scan'
           format: 'table'
@@ -105,7 +220,7 @@ jobs:
           severity: 'CRITICAL,HIGH,MEDIUM'
           exit-code: '0'
 
-      - name: Run Trivy JSON
+      - name: Run Trivy (SARIF for counts)
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: '${{ env.IMAGE_NAME }}:scan'
@@ -120,13 +235,14 @@ jobs:
           HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-results.json 2>/dev/null || echo 0)
           MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-results.json 2>/dev/null || echo 0)
           TOTAL=$((CRITICAL + HIGH + MEDIUM))
+
           {
             echo "## Security Scan Results"
             echo ""
             if [ "$CRITICAL" -eq 0 ] && [ "$HIGH" -eq 0 ]; then
-              echo "No critical or high vulnerabilities found"
+              echo "> **No critical or high vulnerabilities found**"
             else
-              echo "Vulnerabilities detected"
+              echo "> **Vulnerabilities detected — review recommended**"
             fi
             echo ""
             echo "| Severity | Count |"
@@ -134,7 +250,14 @@ jobs:
             echo "| Critical | ${CRITICAL} |"
             echo "| High | ${HIGH} |"
             echo "| Medium | ${MEDIUM} |"
-            echo "| Total | ${TOTAL} |"
+            echo "| **Total** | **${TOTAL}** |"
+            echo ""
+            echo "<details><summary>Full scan output</summary>"
+            echo ""
+            echo '```'
+            cat trivy-results.txt
+            echo '```'
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload scan results
@@ -148,10 +271,33 @@ jobs:
     name: Deploy
     runs-on: ubuntu-latest
     needs: [build, security-scan]
-    if: github.event_name == 'push' && needs.build.outputs.image-tag != '' && secrets.DEPLOY_HOST != '' && secrets.DEPLOY_USER != '' && secrets.DEPLOY_SSH_KEY != ''
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment: production
+
     steps:
+      - name: Check deploy credentials
+        id: check_creds
+        run: |
+          if [ -z "${{ secrets.DEPLOY_HOST }}" ] || \
+             [ -z "${{ secrets.DEPLOY_USER }}" ] || \
+             [ -z "${{ secrets.DEPLOY_SSH_KEY }}" ]; then
+            echo "has_creds=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_creds=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Skip deploy (no credentials)
+        if: steps.check_creds.outputs.has_creds == 'false'
+        run: |
+          {
+            echo "## Deploy Skipped"
+            echo ""
+            echo "> No deployment credentials found."
+            echo "> Skipping deployment step safely."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Deploy to server
+        if: steps.check_creds.outputs.has_creds == 'true'
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.DEPLOY_HOST }}
@@ -164,6 +310,7 @@ jobs:
             docker image prune -f
 
       - name: Verify deployment
+        if: steps.check_creds.outputs.has_creds == 'true'
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.DEPLOY_HOST }}
@@ -185,9 +332,25 @@ jobs:
             echo ""
             echo "| Detail | Value |"
             echo "|--------|-------|"
-            echo "| Environment | production |"
-            echo "| Image | \`${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image-tag }}\` |"
-            echo "| Commit | \`${{ github.sha }}\` |"
-            echo "| Triggered by | @${{ github.actor }} |"
-            echo "| Status | ${{ job.status }} |"
+            echo "| **Environment** | \`production\` |"
+            echo "| **Image** | \`${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image-tag }}\` |"
+            echo "| **Commit** | \`${{ github.sha }}\` |"
+            echo "| **Triggered by** | @${{ github.actor }} |"
+            if [ "${{ steps.check_creds.outputs.has_creds }}" = "true" ]; then
+              echo "| **Status** | ${{ job.status == 'success' && 'Deployed' || 'Failed' }} |"
+            else
+              echo "| **Status** | Skipped (no credentials) |"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rollback on failure
+        if: failure() && steps.check_creds.outputs.has_creds == 'true'
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd ${{ secrets.DEPLOY_PATH }}/drupal
+            docker compose up -d --no-build
+            echo "Rolled back to previous image"
