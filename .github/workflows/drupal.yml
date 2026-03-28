@@ -132,7 +132,7 @@ jobs:
           fi
 
           # Test PHP modules
-          MODULES=$(docker exec drupal-php php -m 2>/dev/null | grep -cE 'gd|mysqli|pdo_mysql|zip|opcache|exif')
+          MODULES=$(docker exec drupal-app php -m 2>/dev/null | grep -cE 'gd|mysqli|pdo_mysql|zip|opcache|exif')
           if [ "$MODULES" -ge 5 ]; then
             RESULTS="${RESULTS}| PHP extensions (${MODULES}/6) | - | Pass |"$'\n'
           else
@@ -141,7 +141,7 @@ jobs:
           fi
 
           # Test Apache rewrite module
-          if docker exec drupal-php apache2ctl -M 2>/dev/null | grep -q rewrite; then
+          if docker exec drupal-app apache2ctl -M 2>/dev/null | grep -q rewrite; then
             RESULTS="${RESULTS}| Apache mod_rewrite | - | Pass |"$'\n'
           else
             RESULTS="${RESULTS}| Apache mod_rewrite | - | **FAIL** |"$'\n'
