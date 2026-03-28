@@ -9,6 +9,7 @@ on:
     branches: [main]
     paths:
       - 'wordpress/**'
+  workflow_dispatch:
 
 env:
   IMAGE_NAME: steven58380/bedrock
